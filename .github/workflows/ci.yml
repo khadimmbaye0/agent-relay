@@ -53,7 +53,7 @@ jobs:
       KUBECONFIG: /root/.kube/config
     container:
       image: catthehacker/ubuntu:act-latest
-      options: --network=host -v /var/run/docker.sock:/var/run/docker.sock:ro -v /home/khadim/.kube:/root/.kube:ro
+      options: -v /var/run/docker.sock:/var/run/docker.sock:ro -v /home/khadim/.kube:/root/.kube:ro
     steps:
       - uses: actions/checkout@v4
       - name: Install kind and kubectl
