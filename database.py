@@ -1,25 +1,43 @@
-"""SQLite database setup and durable Agent Relay models.
+"""PostgreSQL setup and durable Agent Relay models.
 
-This module is intentionally the only place that knows about SQLite connection
-pragmas and its writer-lock transaction.  The rest of the application talks to
-the models through :mod:`storage`; replacing this module with a PostgreSQL
-engine and a row-locking claim transaction is the planned student exercise.
+This module is intentionally the only place that knows about the connection
+URL, the engine, and the transactional primitives.  The rest of the application
+talks to the models through :mod:`storage`.
+
+Concurrency: SQLite's starter version serialized every writer behind a global
+``BEGIN IMMEDIATE`` reservation because SQLite has no row locking.  PostgreSQL
+does, so claims and recovery use ``SELECT ... FOR UPDATE SKIP LOCKED`` instead:
+several API processes and workers can claim concurrently, each gets a different
+task, and none of them blocks on the others.
 """
 
 from __future__ import annotations
 
+import logging
 import os
+import re
+import time
 from contextlib import contextmanager
 from datetime import datetime, timezone
-from typing import Any, Generator
+from typing import Generator
 
-from sqlalchemy import DateTime, ForeignKey, Integer, String, Text, UniqueConstraint, create_engine, event, select
-from sqlalchemy.engine import Engine
+from sqlalchemy import DateTime, ForeignKey, Integer, String, Text, UniqueConstraint, create_engine, select, text
+from sqlalchemy.engine import Engine, make_url
+from sqlalchemy.exc import OperationalError
 from sqlalchemy.orm import DeclarativeBase, Mapped, Session, mapped_column, relationship, sessionmaker
 
 
+LOGGER = logging.getLogger("agent_relay.database")
+
+# Matches the host port published by the bundled compose.yaml, so `uv run
+# uvicorn main:app` on a developer machine talks to `docker compose up postgres`
+# without extra configuration.  Override with RELAY_DATABASE_URL.
+DEFAULT_DATABASE_URL = "postgresql+psycopg://relay:relay@127.0.0.1:55432/relay"
+SAFE_IDENTIFIER = re.compile(r"^[A-Za-z0-9_.\-]+$")
+
+
 def _database_url() -> str:
-    return os.getenv("RELAY_DATABASE_URL") or os.getenv("DATABASE_URL") or "sqlite:///./agent-relay.db"
+    return os.getenv("RELAY_DATABASE_URL") or os.getenv("DATABASE_URL") or DEFAULT_DATABASE_URL
 
 
 def positive_int(name: str, default: int) -> int:
@@ -35,8 +53,20 @@ LEASE_SECONDS = positive_int("RELAY_LEASE_SECONDS", 60)
 MAX_ATTEMPTS = positive_int("RELAY_MAX_ATTEMPTS", 5)
 RECOVERY_INTERVAL_SECONDS = max(1, positive_int("RELAY_RECOVERY_INTERVAL_SECONDS", 5))
 MAX_BODY_BYTES = positive_int("RELAY_MAX_BODY_BYTES", 256 * 1024)
+STARTUP_RETRY_SECONDS = positive_int("RELAY_STARTUP_RETRY_SECONDS", 30)
 DEFAULT_PAGE_SIZE = 50
 MAX_PAGE_SIZE = 100
+
+# Errors that are worth retrying: the connection may simply not be ready yet, or
+# two transactions collided in a way PostgreSQL expects the client to retry.
+TRANSIENT_ERROR_MARKERS = (
+    "deadlock",
+    "could not serialize",
+    "connection",
+    "server closed the connection",
+    "shutting down",
+    "too many clients",
+)
 
 
 def utcnow() -> datetime:
@@ -44,7 +74,7 @@ def utcnow() -> datetime:
 
 
 def as_db_time(value: datetime) -> datetime:
-    """SQLite's DateTime implementation is most portable with naive UTC."""
+    """Columns store naive UTC so timestamps stay directly comparable in SQL."""
 
     return value.astimezone(timezone.utc).replace(tzinfo=None)
 
@@ -130,36 +160,69 @@ class Attempt(Base):
     task: Mapped[Task] = relationship("Task", back_populates="attempts")
 
 
-def _is_sqlite(url: str) -> bool:
-    return url.startswith("sqlite")
-
-
-engine_kwargs: dict[str, Any] = {"future": True, "pool_pre_ping": True}
-if _is_sqlite(DATABASE_URL):
-    engine_kwargs.update({"connect_args": {"check_same_thread": False, "timeout": 30}})
-    if DATABASE_URL in {"sqlite://", "sqlite:///:memory:"}:
-        from sqlalchemy.pool import StaticPool
-
-        engine_kwargs["poolclass"] = StaticPool
-
-engine: Engine = create_engine(DATABASE_URL, **engine_kwargs)
-
-if _is_sqlite(DATABASE_URL):
-
-    @event.listens_for(engine, "connect")
-    def _sqlite_pragmas(dbapi_connection: Any, _connection_record: Any) -> None:
-        cursor = dbapi_connection.cursor()
-        cursor.execute("PRAGMA foreign_keys=ON")
-        cursor.execute("PRAGMA busy_timeout=30000")
-        cursor.execute("PRAGMA journal_mode=WAL")
-        cursor.close()
+engine: Engine = create_engine(
+    DATABASE_URL,
+    # Verification catches connections dropped by a database restart or an idle
+    # timeout; the pool is generous because claims are short-lived transactions
+    # and several workers poll at once.
+    pool_pre_ping=True,
+    pool_size=positive_int("RELAY_POOL_SIZE", 10),
+    max_overflow=positive_int("RELAY_POOL_OVERFLOW", 20),
+)
 
 
 SessionLocal = sessionmaker(bind=engine, class_=Session, expire_on_commit=False, autoflush=True)
 
 
+def is_transient_error(exc: Exception) -> bool:
+    """True when retrying may succeed: restarting server, deadlock, and so on."""
+
+    message = str(getattr(exc, "orig", exc)).lower()
+    return any(marker in message for marker in TRANSIENT_ERROR_MARKERS)
+
+
+def ensure_database(url: str = DATABASE_URL) -> None:
+    """Create the target PostgreSQL database when it does not exist yet.
+
+    The relay ships no migration tool, so pointing it at a fresh server should
+    not require a manual ``createdb``.  This connects to the server's
+    maintenance database and creates the target only when it is missing.
+    """
+
+    parsed = make_url(url)
+    if parsed.get_backend_name() != "postgresql" or not parsed.database:
+        return
+    if not SAFE_IDENTIFIER.match(parsed.database):
+        raise ValueError(f"refusing to create unsafely named database {parsed.database!r}")
+    admin = create_engine(parsed.set(database="postgres"), isolation_level="AUTOCOMMIT", pool_pre_ping=True)
+    try:
+        with admin.connect() as connection:
+            present = connection.execute(
+                text("select 1 from pg_database where datname = :name"), {"name": parsed.database}
+            ).scalar()
+            if not present:
+                # CREATE DATABASE takes no bind parameter; the identifier is
+                # validated by SAFE_IDENTIFIER before it reaches this string.
+                connection.exec_driver_sql(f'CREATE DATABASE "{parsed.database}"')
+                LOGGER.info("created database %s", parsed.database)
+    finally:
+        admin.dispose()
+
+
 def init_db() -> None:
-    Base.metadata.create_all(engine)
+    """Create the database and schema, retrying while the server comes up."""
+
+    deadline = time.monotonic() + STARTUP_RETRY_SECONDS
+    while True:
+        try:
+            ensure_database()
+            Base.metadata.create_all(engine)
+            return
+        except OperationalError as exc:
+            if not is_transient_error(exc) or time.monotonic() >= deadline:
+                raise
+            LOGGER.warning("database not ready yet (%s); retrying", exc.orig)
+            time.sleep(1)
 
 
 @contextmanager
@@ -175,32 +238,6 @@ def db_session() -> Generator[Session, None, None]:
         db.close()
 
 
-@contextmanager
-def immediate_transaction() -> Generator[Session, None, None]:
-    """Run one SQLite writer transaction before selecting or changing work.
-
-    SQLite does not support PostgreSQL's ``FOR UPDATE SKIP LOCKED``.  A
-    ``BEGIN IMMEDIATE`` writer reservation serializes claims (and recovery or
-    terminal submissions) across API processes, giving each task one active
-    lease.  This is the intentionally isolated seam for a future PostgreSQL
-    implementation.
-    """
-
-    connection = engine.connect()
-    session = Session(bind=connection, expire_on_commit=False, autoflush=True)
-    try:
-        connection.exec_driver_sql("BEGIN IMMEDIATE")
-        yield session
-        session.flush()
-        connection.commit()
-    except Exception:
-        connection.rollback()
-        raise
-    finally:
-        session.close()
-        connection.close()
-
-
 def recover_expired_in_session(db: Session, now: datetime) -> int:
     """Expire active leases and requeue/fail their tasks within ``db``."""
 
@@ -210,6 +247,10 @@ def recover_expired_in_session(db: Session, now: datetime) -> int:
             select(Attempt)
             .where(Attempt.outcome == "processing", Attempt.lease_expires_at <= now_db)
             .order_by(Attempt.lease_expires_at, Attempt.id)
+            # A concurrent recovery pass skips an attempt another process
+            # already locked instead of waiting for it; that process requeues
+            # the task itself.
+            .with_for_update(skip_locked=True)
         )
     )
     count = 0
@@ -235,7 +276,7 @@ def recover_expired_in_session(db: Session, now: datetime) -> int:
 def recover_expired() -> int:
     """Run one recovery pass and return the number of expired attempts."""
 
-    with immediate_transaction() as db:
+    with db_session() as db:
         return recover_expired_in_session(db, utcnow())
 
 
@@ -244,6 +285,7 @@ __all__ = [
     "Attempt",
     "Base",
     "DATABASE_URL",
+    "DEFAULT_DATABASE_URL",
     "DEFAULT_PAGE_SIZE",
     "LEASE_SECONDS",
     "MAX_ATTEMPTS",
@@ -255,8 +297,9 @@ __all__ = [
     "db_session",
     "db_time",
     "engine",
-    "immediate_transaction",
+    "ensure_database",
     "init_db",
+    "is_transient_error",
     "iso_time",
     "recover_expired",
     "recover_expired_in_session",

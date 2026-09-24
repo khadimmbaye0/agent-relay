@@ -1,0 +1,112 @@
+# PostgreSQL for Agent Relay.
+#
+# A StatefulSet rather than a Deployment: the database needs a stable identity
+# and its own PersistentVolumeClaim, which volumeClaimTemplates provides. One
+# replica only — PostgreSQL does not tolerate two writers on the same volume.
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: postgres
+  namespace: agent-relay
+  labels:
+    app.kubernetes.io/name: postgres
+    app.kubernetes.io/part-of: agent-relay
+spec:
+  # Headless: the relay dials the Service name `postgres`, which resolves to the
+  # pod. Nothing needs a virtual IP in front of a single database pod.
+  clusterIP: None
+  selector:
+    app.kubernetes.io/name: postgres
+  ports:
+    - name: postgres
+      port: 5432
+      targetPort: postgres
+---
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: postgres
+  namespace: agent-relay
+  labels:
+    app.kubernetes.io/name: postgres
+    app.kubernetes.io/part-of: agent-relay
+spec:
+  serviceName: postgres
+  replicas: 1
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: postgres
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: postgres
+        app.kubernetes.io/part-of: agent-relay
+    spec:
+      # Give PostgreSQL time to shut down cleanly; it is the only writer and a
+      # hard kill means crash recovery on the next start.
+      terminationGracePeriodSeconds: 60
+      containers:
+        - name: postgres
+          image: postgres:16-alpine
+          imagePullPolicy: IfNotPresent
+          ports:
+            - name: postgres
+              containerPort: 5432
+          env:
+            - name: POSTGRES_USER
+              valueFrom:
+                secretKeyRef:
+                  name: relay-database
+                  key: POSTGRES_USER
+            - name: POSTGRES_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: relay-database
+                  key: POSTGRES_PASSWORD
+            - name: POSTGRES_DB
+              valueFrom:
+                secretKeyRef:
+                  name: relay-database
+                  key: POSTGRES_DB
+            # Keep the cluster inside a subdirectory of the mount so a volume
+            # that arrives with other content is still usable.
+            - name: PGDATA
+              value: /var/lib/postgresql/data/pgdata
+          volumeMounts:
+            - name: data
+              mountPath: /var/lib/postgresql/data
+          # Readiness gates the Service endpoint, so the relay only sees a
+          # database that accepts connections.
+          readinessProbe:
+            exec:
+              command: ["sh", "-c", "pg_isready -U \"$POSTGRES_USER\" -d \"$POSTGRES_DB\""]
+            initialDelaySeconds: 5
+            periodSeconds: 5
+            timeoutSeconds: 3
+            failureThreshold: 6
+          # Liveness restarts a wedged postmaster that stops answering.
+          livenessProbe:
+            exec:
+              command: ["sh", "-c", "pg_isready -U \"$POSTGRES_USER\" -d \"$POSTGRES_DB\""]
+            initialDelaySeconds: 30
+            periodSeconds: 10
+            timeoutSeconds: 5
+            failureThreshold: 6
+          resources:
+            requests:
+              cpu: 100m
+              memory: 256Mi
+            limits:
+              memory: 1Gi
+  volumeClaimTemplates:
+    - metadata:
+        name: data
+        labels:
+          app.kubernetes.io/name: postgres
+          app.kubernetes.io/part-of: agent-relay
+      spec:
+        accessModes: ["ReadWriteOnce"]
+        resources:
+          requests:
+            storage: 1Gi

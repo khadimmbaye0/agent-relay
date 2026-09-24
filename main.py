@@ -1,6 +1,6 @@
 """FastAPI routes for Agent Relay.
 
-Persistence and SQLite transaction details live in :mod:`database` and
+Persistence and PostgreSQL row-locking details live in :mod:`database` and
 :mod:`storage`; the deterministic local worker is in :mod:`worker`.
 """
 
@@ -29,6 +29,7 @@ from database import (
     RECOVERY_INTERVAL_SECONDS,
     db_session,
     init_db,
+    is_transient_error,
     recover_expired,
 )
 from dashboard import dashboard_html
@@ -210,7 +211,8 @@ async def tasks_create(
             result = create_task(current.id, body.to, body.input, idempotency_key)
             return JSONResponse(status_code=201, content=result)
         except OperationalError as exc:
-            if retry == 2 or "locked" not in str(exc).lower():
+            # A deadlock or a dropping connection is worth one more attempt.
+            if retry == 2 or not is_transient_error(exc):
                 raise
             await asyncio.sleep(0.05 * (retry + 1))
     raise RelayError("storage_error", "The task could not be persisted.", 503)
@@ -226,7 +228,9 @@ async def claim(
         try:
             result = await asyncio.to_thread(claim_one, current.id, body.worker_id)
         except OperationalError as exc:
-            if "locked" not in str(exc).lower():
+            # Treat a transient database error like an empty poll: the caller
+            # keeps waiting until its deadline instead of receiving a 500.
+            if not is_transient_error(exc):
                 raise
             result = None
         if result is not None:

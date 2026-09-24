@@ -1,0 +1,15 @@
+# Keep the local virtualenv (tens of MB) and tool caches out of the context.
+.venv/
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.ruff_cache/
+
+# Local credentials must never be baked into the image.
+*-credentials.json
+
+# VCS metadata and container plumbing.
+.git/
+.gitignore
+Dockerfile
+.dockerignore

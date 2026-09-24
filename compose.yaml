@@ -1,0 +1,45 @@
+# Agent Relay and its PostgreSQL database.
+#
+#   docker compose up --build       # relay on http://127.0.0.1:8000/
+#   docker compose up -d postgres   # database only, for `uv run pytest`
+#
+# The relay waits for PostgreSQL to report healthy, and both services keep their
+# state in named volumes, so replacing a container does not lose queued work.
+
+name: agent-relay
+
+services:
+  postgres:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER:-relay}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-relay}
+      POSTGRES_DB: ${POSTGRES_DB:-relay}
+    # Inside the compose network the database is always `postgres:5432`. On the
+    # host it is bound to 127.0.0.1 on another port so it neither collides with
+    # nor exposes a locally installed PostgreSQL.
+    ports:
+      - "127.0.0.1:${RELAY_POSTGRES_PORT:-55432}:5432"
+    volumes:
+      - postgres-data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U $$POSTGRES_USER -d $$POSTGRES_DB"]
+      interval: 5s
+      timeout: 3s
+      retries: 12
+
+  relay:
+    build: .
+    image: agent-relay:local
+    environment:
+      # The image's own code has no database default that suits a container, so
+      # the URL is set here. DATABASE_URL is accepted as a fallback.
+      RELAY_DATABASE_URL: postgresql+psycopg://${POSTGRES_USER:-relay}:${POSTGRES_PASSWORD:-relay}@postgres:5432/${POSTGRES_DB:-relay}
+    ports:
+      - "${RELAY_PORT:-8000}:8000"
+    depends_on:
+      postgres:
+        condition: service_healthy
+
+volumes:
+  postgres-data:

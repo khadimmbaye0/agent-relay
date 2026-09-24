@@ -1,0 +1,8 @@
+# Everything for this stack lives in one namespace so the whole deployment can
+# be inspected or removed with a single label selector.
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: agent-relay
+  labels:
+    app.kubernetes.io/part-of: agent-relay

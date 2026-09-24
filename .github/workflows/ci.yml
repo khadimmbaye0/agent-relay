@@ -1,0 +1,86 @@
+name: CI and local kind deployment
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+env:
+  POSTGRES_USER: relay
+  POSTGRES_PASSWORD: relay
+  POSTGRES_DB: relay
+  RELAY_DATABASE_URL: postgresql+psycopg://relay:relay@host.docker.internal:5432/relay_test
+  RELAY_TEST_DATABASE_URL: postgresql+psycopg://relay:relay@host.docker.internal:5432/relay_acceptance
+  TEST_POSTGRES_PORT: 54321
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:16-alpine
+        env:
+          POSTGRES_USER: relay
+          POSTGRES_PASSWORD: relay
+          POSTGRES_DB: relay
+        ports:
+          - 54321:5432
+        options: >-
+          --health-cmd "pg_isready -U relay -d relay"
+          --health-interval 5s
+          --health-timeout 3s
+          --health-retries 12
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v5
+      - name: Install locked dependencies
+        run: uv sync --frozen
+      - name: Run protocol and PostgreSQL acceptance tests
+        env:
+          PGPORT: ${{ env.TEST_POSTGRES_PORT }}
+        run: |
+          export RELAY_DATABASE_URL="postgresql+psycopg://relay:relay@127.0.0.1:${TEST_POSTGRES_PORT}/relay_test"
+          export RELAY_TEST_DATABASE_URL="postgresql+psycopg://relay:relay@127.0.0.1:${TEST_POSTGRES_PORT}/relay_acceptance"
+          uv run pytest -q test_agent_relay.py test_acceptance_scenario_1.py
+
+  deploy-kind:
+    needs: test
+    runs-on: ubuntu-latest
+    env:
+      KIND_CLUSTER: agent-relay
+      IMAGE_REPOSITORY: agent-relay
+      DOCKER_HOST: unix:///var/run/docker.sock
+      KUBECONFIG: /root/.kube/config
+    container:
+      image: catthehacker/ubuntu:act-latest
+      options: --network=host -v /var/run/docker.sock:/var/run/docker.sock:ro -v /home/khadim/.kube:/root/.kube:ro
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install kind and kubectl
+        run: |
+          curl -Lo ./kind https://kind.sigs.k8s.io/dl/v0.20.0/kind-linux-amd64
+          chmod +x ./kind
+          mv ./kind /usr/local/bin/kind
+          curl -LO "https://dl.k8s.io/release/$(curl -L -s https://dl.k8s.io/release/stable.txt)/bin/linux/amd64/kubectl"
+          chmod +x ./kubectl
+          mv ./kubectl /usr/local/bin/kubectl
+      - name: Verify local Docker and kind access
+        run: |
+          export DOCKER_HOST=unix:///var/run/docker.sock
+          docker info
+          kind get clusters | grep -Fx "$KIND_CLUSTER" || echo "kind cluster not found"
+          kubectl config use-context "kind-$KIND_CLUSTER" 2>/dev/null || echo "kubectl context not found"
+          kubectl cluster-info 2>/dev/null || echo "cluster info not available"
+      - name: Build and load the versioned image
+        run: |
+          IMAGE="$IMAGE_REPOSITORY:${GITHUB_SHA}-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}-$(date +%s)"
+          echo "IMAGE=$IMAGE" >> "$GITHUB_ENV"
+          docker build --tag "$IMAGE" .
+          kind load docker-image "$IMAGE" --name "$KIND_CLUSTER"
+      - name: Deploy only the tested image and wait for readiness
+        run: |
+          kubectl apply -f k8s/namespace.yaml -f k8s/secret.yaml -f k8s/postgres.yaml -f k8s/relay.yaml
+          kubectl set image -n agent-relay deployment/relay relay="$IMAGE"
+          kubectl rollout status -n agent-relay statefulset/postgres --timeout=180s
+          kubectl rollout status -n agent-relay deployment/relay --timeout=180s
+          kubectl wait -n agent-relay --for=condition=Ready pod -l app.kubernetes.io/name=relay --timeout=60s

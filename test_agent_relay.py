@@ -1,19 +1,21 @@
-"""Protocol tests for the SQLite starter.
+"""Protocol tests for the PostgreSQL implementation.
 
-These tests intentionally exercise storage calls from multiple threads: that
-is the closest local equivalent to several worker processes racing to claim an
-inbox.  The production guarantee comes from SQLite's BEGIN IMMEDIATE boundary,
-not from a Python lock.
+These tests intentionally exercise storage calls from multiple threads: that is
+the closest in-process equivalent to several worker processes racing to claim an
+inbox.  The production guarantee comes from PostgreSQL's ``FOR UPDATE SKIP
+LOCKED`` claim, not from a Python lock.
 """
 
 from __future__ import annotations
 
 import os
 
-# Default to a scratch DB so `pytest` never resets the dev server's
-# `./agent-relay.db`. Respect an explicit RELAY_DATABASE_URL/DATABASE_URL
-# (e.g. CI pointing at PostgreSQL), but otherwise isolate tests.
-os.environ.setdefault("RELAY_DATABASE_URL", "sqlite:////tmp/agent-relay-test.db")
+# Default to a scratch database so `pytest` never resets the relay's own data.
+# The database is created on demand by `init_db()`, so only a running server is
+# required (`docker compose up -d postgres`).  Respect an explicit
+# RELAY_DATABASE_URL/DATABASE_URL, but otherwise stay isolated.
+TEST_DATABASE_URL = "postgresql+psycopg://relay:relay@127.0.0.1:55432/relay_test"
+os.environ.setdefault("RELAY_DATABASE_URL", TEST_DATABASE_URL)
 
 from concurrent.futures import ThreadPoolExecutor
 from datetime import timedelta
@@ -28,8 +30,10 @@ from storage import claim_one
 
 @pytest.fixture(autouse=True)
 def empty_database():
-    # Resets whatever DB RELAY_DATABASE_URL points at. Defaults to the
-    # scratch /tmp file above; never run against a DB with data you need.
+    # Resets whatever RELAY_DATABASE_URL points at. Defaults to the scratch
+    # `relay_test` database above; never run against a database with data you
+    # need.  Dropping instead of truncating also removes rows other test modules
+    # may have left in tables this suite does not know about.
     Base.metadata.drop_all(engine)
     Base.metadata.create_all(engine)
     yield
@@ -98,7 +102,7 @@ def test_protocol_idempotency_terminal_retry_and_auth_boundary():
         assert "claim_token" not in attempts["items"][0]
 
 
-def test_sqlite_atomic_claims_distribute_without_overlap():
+def test_concurrent_claims_distribute_without_overlap():
     with TestClient(main.app) as client:
         _sender, sender_headers = register(client, "sender")
         recipient, _recipient_headers = register(client, "recipient")

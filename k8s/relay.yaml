@@ -1,0 +1,108 @@
+# Agent Relay: the FastAPI service, its ClusterIP Service, and health probes.
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: relay
+  namespace: agent-relay
+  labels:
+    app.kubernetes.io/name: relay
+    app.kubernetes.io/part-of: agent-relay
+spec:
+  # Reach it from your machine with:
+  #   kubectl port-forward -n agent-relay svc/relay 8080:8000
+  type: ClusterIP
+  selector:
+    app.kubernetes.io/name: relay
+  ports:
+    - name: http
+      port: 8000
+      targetPort: http
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: relay
+  namespace: agent-relay
+  labels:
+    app.kubernetes.io/name: relay
+    app.kubernetes.io/part-of: agent-relay
+spec:
+  # One replica is plenty locally. Raising it is safe by design — claims use
+  # FOR UPDATE SKIP LOCKED, so two API processes never hand out the same task —
+  # but scale up after the first boot: a brand-new database is created by
+  # init_db(), and two pods bootstrapping it simultaneously can collide.
+  replicas: 1
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: relay
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: relay
+        app.kubernetes.io/part-of: agent-relay
+    spec:
+      containers:
+        - name: relay
+          # Built from the Dockerfile in this repository and loaded into the
+          # kind node with `kind load docker-image agent-relay:local`.
+          image: agent-relay:local
+          imagePullPolicy: IfNotPresent
+          ports:
+            - name: http
+              containerPort: 8000
+          env:
+            # The only configuration the relay needs: where the database is.
+            - name: RELAY_DATABASE_URL
+              valueFrom:
+                secretKeyRef:
+                  name: relay-database
+                  key: RELAY_DATABASE_URL
+          # Probes use the image's own Python because the slim runtime has no
+          # curl. /health is liveness, /ready verifies database connectivity and
+          # schema, which is what should gate traffic to a pod.
+          startupProbe:
+            exec:
+              command:
+                - python
+                - -c
+                - import urllib.request; urllib.request.urlopen('http://127.0.0.1:8000/health', timeout=2)
+            periodSeconds: 5
+            timeoutSeconds: 3
+            failureThreshold: 24
+          readinessProbe:
+            exec:
+              command:
+                - python
+                - -c
+                - import urllib.request; urllib.request.urlopen('http://127.0.0.1:8000/ready', timeout=2)
+            periodSeconds: 5
+            timeoutSeconds: 3
+            failureThreshold: 3
+          livenessProbe:
+            exec:
+              command:
+                - python
+                - -c
+                - import urllib.request; urllib.request.urlopen('http://127.0.0.1:8000/health', timeout=2)
+            periodSeconds: 15
+            timeoutSeconds: 3
+            failureThreshold: 3
+          resources:
+            requests:
+              cpu: 100m
+              memory: 128Mi
+            limits:
+              memory: 512Mi
+          securityContext:
+            # The image already runs as uid 10001 and writes nothing to disk, so
+            # the pod needs no privileges and no writable root filesystem.
+            runAsNonRoot: true
+            runAsUser: 10001
+            runAsGroup: 10001
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: ["ALL"]
+            seccompProfile:
+              type: RuntimeDefault
