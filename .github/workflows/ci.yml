@@ -49,11 +49,6 @@ jobs:
     env:
       KIND_CLUSTER: agent-relay
       IMAGE_REPOSITORY: agent-relay
-      DOCKER_HOST: unix:///var/run/docker.sock
-      KUBECONFIG: /root/.kube/config
-    container:
-      image: catthehacker/ubuntu:act-latest
-      options: -v /home/khadim/.kube:/root/.kube:ro
     steps:
       - uses: actions/checkout@v4
       - name: Install kind and kubectl
@@ -66,11 +61,7 @@ jobs:
           mv ./kubectl /usr/local/bin/kubectl
       - name: Verify local Docker and kind access
         run: |
-          export DOCKER_HOST=unix:///var/run/docker.sock
-          docker info
-          kind get clusters | grep -Fx "$KIND_CLUSTER" || echo "kind cluster not found"
-          kubectl config use-context "kind-$KIND_CLUSTER" 2>/dev/null || echo "kubectl context not found"
-          kubectl cluster-info 2>/dev/null || echo "cluster info not available"
+          kind get clusters
       - name: Build and load the versioned image
         run: |
           IMAGE="$IMAGE_REPOSITORY:${GITHUB_SHA}-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}-$(date +%s)"
